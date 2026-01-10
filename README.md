@@ -17,7 +17,21 @@ A complete authentication system using Amazon Cognito with email verification, d
 - **Frontend**: React with TypeScript and AWS Amplify
 - **Authentication**: AWS Cognito User Pool
 - **Hosting**: S3 + CloudFront distribution
-- **Infrastructure**: AWS CDK (TypeScript)
+- **Infrastructure**: AWS CDK (TypeScript) **or** CloudFormation (YAML)
+
+## Deployment Options
+
+This project supports two deployment methods:
+
+1. **CloudFormation** (Recommended) - Pure CloudFormation template with no circular dependencies
+   - See [CloudFormation README](infrastructure/cloudformation/README.md) for details
+   - Simpler, more transparent, no build step for infrastructure
+   - Separate infrastructure and deployment steps
+
+2. **AWS CDK** - TypeScript-based infrastructure as code
+   - Single command deployment
+   - Automatic frontend deployment
+   - Type safety and reusable constructs
 
 ## Prerequisites
 
@@ -40,14 +54,29 @@ git clone <repository-url>
 cd cognito-login
 ```
 
-### 2. Deploy Using the Automated Script
+### 2. Choose Your Deployment Method
+
+#### Option A: CloudFormation (Recommended)
+
+```bash
+chmod +x infrastructure/cloudformation/deploy-cloudformation.sh
+./infrastructure/cloudformation/deploy-cloudformation.sh
+```
+
+**Advantages**: No circular dependencies, simpler troubleshooting, no infrastructure build step
+
+See [CloudFormation README](infrastructure/cloudformation/README.md) for detailed documentation.
+
+#### Option B: AWS CDK
 
 ```bash
 chmod +x deploy.sh
 ./deploy.sh
 ```
 
-This script will:
+**Advantages**: Single command deployment, automatic frontend deployment
+
+Both scripts will:
 - Install all dependencies
 - Build the frontend application
 - Deploy the AWS infrastructure
