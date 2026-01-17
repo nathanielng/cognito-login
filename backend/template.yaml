@@ -1,0 +1,449 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IAM Identity Center User Management API'
+
+Parameters:
+  IdentityCenterInstanceArn:
+    Type: String
+    Description: ARN of the IAM Identity Center instance
+    Default: ''
+  
+  ApiKeyValue:
+    Type: String
+    Description: API Key for authentication
+    NoEcho: true
+    MinLength: 20
+
+Resources:
+  # IAM Role for Lambda function
+  UserManagementLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IdentityCenterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sso-admin:*
+                  - identitystore:*
+                  - sso:ListInstances
+                Resource: '*'
+
+  # Lambda function for user management
+  UserManagementFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-user-management'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt UserManagementLambdaRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from botocore.exceptions import ClientError
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize AWS clients
+          identitystore_client = boto3.client('identitystore')
+          sso_admin_client = boto3.client('sso-admin')
+
+          def lambda_handler(event, context):
+              """
+              Lambda function to create IAM Identity Center users and add them to Kiro Pro group
+              """
+              try:
+                  # Parse request body
+                  if 'body' in event:
+                      body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+                  else:
+                      body = event
+                  
+                  # Validate required fields
+                  required_fields = ['name', 'email']
+                  for field in required_fields:
+                      if field not in body:
+                          return create_response(400, f"Missing required field: {field}")
+                  
+                  # Extract user information
+                  name = body['name']
+                  email = body['email']
+                  first_name = body.get('firstName', name.split()[0] if ' ' in name else name)
+                  last_name = body.get('lastName', name.split()[-1] if ' ' in name and len(name.split()) > 1 else '')
+                  
+                  # Get Identity Center instance ARN from environment
+                  instance_arn = os.environ.get('IDENTITY_CENTER_INSTANCE_ARN')
+                  if not instance_arn:
+                      return create_response(500, "Identity Center instance ARN not configured")
+                  
+                  # Extract identity store ID from instance ARN
+                  identity_store_id = get_identity_store_id(instance_arn)
+                  
+                  # Create user in Identity Center
+                  user_result = create_identity_center_user(
+                      identity_store_id, 
+                      name, 
+                      email, 
+                      first_name, 
+                      last_name
+                  )
+                  
+                  if not user_result['success']:
+                      return create_response(500, user_result['error'])
+                  
+                  user_id = user_result['user_id']
+                  
+                  # Get Kiro Pro group ID
+                  kiro_pro_group_id = get_kiro_pro_group_id(identity_store_id)
+                  if not kiro_pro_group_id:
+                      return create_response(500, "Kiro Pro group not found")
+                  
+                  # Add user to Kiro Pro group
+                  group_result = add_user_to_group(identity_store_id, user_id, kiro_pro_group_id)
+                  
+                  if not group_result['success']:
+                      return create_response(500, group_result['error'])
+                  
+                  return create_response(200, {
+                      "message": "User created successfully",
+                      "user_id": user_id,
+                      "email": email,
+                      "group": "Kiro Pro"
+                  })
+                  
+              except json.JSONDecodeError:
+                  return create_response(400, "Invalid JSON in request body")
+              except Exception as e:
+                  logger.error(f"Unexpected error: {str(e)}")
+                  return create_response(500, f"Internal server error: {str(e)}")
+
+          def get_identity_store_id(instance_arn):
+              """Extract identity store ID from Identity Center instance"""
+              try:
+                  response = sso_admin_client.list_instances()
+                  for instance in response['Instances']:
+                      if instance['InstanceArn'] == instance_arn:
+                          return instance['IdentityStoreId']
+                  return None
+              except ClientError as e:
+                  logger.error(f"Error getting identity store ID: {e}")
+                  return None
+
+          def create_identity_center_user(identity_store_id, name, email, first_name, last_name):
+              """Create a new user in IAM Identity Center"""
+              try:
+                  # Check if user already exists
+                  existing_user = find_user_by_email(identity_store_id, email)
+                  if existing_user:
+                      return {
+                          'success': False,
+                          'error': f"User with email {email} already exists"
+                      }
+                  
+                  # Create user
+                  response = identitystore_client.create_user(
+                      IdentityStoreId=identity_store_id,
+                      UserName=email,  # Use email as username
+                      Name={
+                          'GivenName': first_name,
+                          'FamilyName': last_name,
+                          'Formatted': name
+                      },
+                      DisplayName=name,
+                      Emails=[
+                          {
+                              'Value': email,
+                              'Type': 'work',
+                              'Primary': True
+                          }
+                      ]
+                  )
+                  
+                  return {
+                      'success': True,
+                      'user_id': response['UserId']
+                  }
+                  
+              except ClientError as e:
+                  error_code = e.response.get('Error', {}).get('Code', '')
+                  
+                  # Handle duplicate user error with a friendly message
+                  if error_code == 'ConflictException':
+                      logger.error(f"Duplicate user detected for email: {email}")
+                      return {
+                          'success': False,
+                          'error': f"User with email {email} already exists"
+                      }
+                  
+                  logger.error(f"Error creating user: {e}")
+                  return {
+                      'success': False,
+                      'error': f"Failed to create user: {str(e)}"
+                  }
+
+          def find_user_by_email(identity_store_id, email):
+              """Find user by email address"""
+              try:
+                  response = identitystore_client.list_users(
+                      IdentityStoreId=identity_store_id,
+                      Filters=[
+                          {
+                              'AttributePath': 'emails.value',
+                              'AttributeValue': email
+                          }
+                      ]
+                  )
+                  
+                  return response['Users'][0] if response['Users'] else None
+                  
+              except ClientError as e:
+                  logger.error(f"Error finding user: {e}")
+                  return None
+
+          def get_kiro_pro_group_id(identity_store_id):
+              """Get the Kiro Pro group ID"""
+              try:
+                  # First try to get from environment variable
+                  group_id = os.environ.get('KIRO_PRO_GROUP_ID')
+                  if group_id and group_id != 'PLACEHOLDER_GROUP_ID':
+                      return group_id
+                  
+                  # If not in env, search for the group
+                  response = identitystore_client.list_groups(
+                      IdentityStoreId=identity_store_id,
+                      Filters=[
+                          {
+                              'AttributePath': 'displayName',
+                              'AttributeValue': 'Kiro Pro'
+                          }
+                      ]
+                  )
+                  
+                  if response['Groups']:
+                      return response['Groups'][0]['GroupId']
+                  
+                  # If group doesn't exist, create it
+                  create_response = identitystore_client.create_group(
+                      IdentityStoreId=identity_store_id,
+                      DisplayName='Kiro Pro',
+                      Description='Kiro Pro users group'
+                  )
+                  
+                  return create_response['GroupId']
+                  
+              except ClientError as e:
+                  logger.error(f"Error getting/creating Kiro Pro group: {e}")
+                  return None
+
+          def add_user_to_group(identity_store_id, user_id, group_id):
+              """Add user to a group"""
+              try:
+                  identitystore_client.create_group_membership(
+                      IdentityStoreId=identity_store_id,
+                      GroupId=group_id,
+                      MemberId={
+                          'UserId': user_id
+                      }
+                  )
+                  
+                  return {'success': True}
+                  
+              except ClientError as e:
+                  logger.error(f"Error adding user to group: {e}")
+                  return {
+                      'success': False,
+                      'error': str(e)
+                  }
+
+          def create_response(status_code, body):
+              """Create HTTP response"""
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                      'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                  },
+                  'body': json.dumps(body) if isinstance(body, dict) else json.dumps({'message': body})
+              }
+      Environment:
+        Variables:
+          IDENTITY_CENTER_INSTANCE_ARN: !Ref IdentityCenterInstanceArn
+
+  # API Gateway
+  UserManagementApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      Description: 'IAM Identity Center User Management API'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Gateway Resource
+  CreateUserResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref UserManagementApi
+      ParentId: !GetAtt UserManagementApi.RootResourceId
+      PathPart: create-user
+
+  # API Gateway Method
+  CreateUserMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UserManagementApi
+      ResourceId: !Ref CreateUserResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UserManagementFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+        - StatusCode: 400
+          ResponseModels:
+            application/json: Empty
+        - StatusCode: 500
+          ResponseModels:
+            application/json: Empty
+
+  # OPTIONS method for CORS
+  CreateUserOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UserManagementApi
+      ResourceId: !Ref CreateUserResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+          ResponseModels:
+            application/json: Empty
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - CreateUserMethod
+      - CreateUserOptionsMethod
+    Properties:
+      RestApiId: !Ref UserManagementApi
+      StageName: prod
+
+  # API Key
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub '${AWS::StackName}-api-key'
+      Description: API Key for User Management API
+      Enabled: true
+      Value: !Ref ApiKeyValue
+
+  # Usage Plan
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiDeployment
+    Properties:
+      UsagePlanName: !Sub '${AWS::StackName}-usage-plan'
+      Description: Usage plan for User Management API
+      ApiStages:
+        - ApiId: !Ref UserManagementApi
+          Stage: prod
+      Throttle:
+        RateLimit: 100
+        BurstLimit: 200
+      Quota:
+        Limit: 10000
+        Period: DAY
+
+  # Link API Key to Usage Plan
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  # Lambda permission for API Gateway
+  LambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UserManagementFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserManagementApi}/*/*'
+
+  # Store API Key securely in Parameter Store
+  ApiKeyParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/kiro/${AWS::StackName}/api-key'
+      Type: String
+      Tier: Advanced
+      Value: !Ref ApiKeyValue
+      Description: 'API Key for IAM Identity Center User Management API'
+
+  # SSM Parameter to store group ID (Lambda will update this)
+  KiroProGroupParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/kiro/${AWS::StackName}/kiro-pro-group-id'
+      Type: String
+      Value: 'PLACEHOLDER_GROUP_ID'
+      Description: 'Group ID for Kiro Pro group in Identity Center'
+
+Outputs:
+  ApiEndpoint:
+    Description: 'API Gateway endpoint URL'
+    Value: !Sub 'https://${UserManagementApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  
+  ApiKeyParameterName:
+    Description: 'SSM Parameter name containing the API key (SecureString)'
+    Value: !Ref ApiKeyParameter
+  
+  ApiKeyId:
+    Description: 'API Key ID'
+    Value: !Ref ApiKey
+  
+  LambdaFunctionArn:
+    Description: 'Lambda Function ARN'
+    Value: !GetAtt UserManagementFunction.Arn
